@@ -1,60 +1,24 @@
 #!/usr/bin/env bun
 import * as fs from "node:fs";
-import { execFileSync } from "node:child_process";
 import { c } from "./colors.ts";
 import { getSearchRoots, collectLeanFiles } from "./scanner.ts";
 import { LeanGraphBuilder } from "./graph.ts";
 import { renderD2 } from "./d2.ts";
 import { sanitizeFileName } from "./parser.ts";
-import { buildInteractiveHtml } from "./html.ts";
+import { buildInteractiveHtml, serveInteractiveHtml, openBrowser } from "./html.ts";
+import { parseCliArgs, printHelp } from "./cli/options.ts";
+import { isD2Available, compileLayoutSvg } from "./cli/compiler.ts";
 
-const isD2Available = (): boolean =>
-  (() => {
-    try {
-      execFileSync("d2", ["--version"], { stdio: "ignore" });
-      return true;
-    } catch {
-      return false;
-    }
-  })();
+export const runCli = async (rawArgs: string[]) => {
+  const options = parseCliArgs(rawArgs);
+  const { query, stdoutOnly, render, wantsHtml, shouldOpen, verbose, includeTypeclasses } = options;
 
-const openInBrowser = (filePath: string) => {
-  try {
-    const cmd = process.platform === "darwin" ? "open" : "xdg-open";
-    execFileSync(cmd, [filePath], { stdio: "ignore" });
-  } catch { }
-};
-
-export const runCli = async (args: string[]) => {
-  const query = args[0];
-  if (!query || args.includes("-h") || args.includes("--help")) {
-    console.log(`${c.bold("Usage:")} lake-definition-diagram <symbol-or-notation> [options]
-
-${c.bold("Examples:")}
-  ${c.cyan('lake-definition-diagram "→+*" --html')}
-  ${c.cyan('lake-definition-diagram "→+*" --html --open')}
-  ${c.cyan('lake-definition-diagram "→+*" -r -v')}
-  ${c.cyan('lake-definition-diagram RingHom -o RingHom.d2')}
-
-${c.bold("Options:")}
-  ${c.dim("-o, --output <file>")}      Output path for .d2, .svg, or .html file
-  ${c.dim("-r, --render")}             Compile .d2 to .svg using 'd2' CLI command
-  ${c.dim("-i, --html")}               Generate interactive .html viewer with hover-tracing
-  ${c.dim("--open")}                   Open the generated .html diagram in the default browser
-  ${c.dim("-v, --verbose, --full")}    Include docstrings, origin, and file paths
-  ${c.dim("-p, --print")}              Print D2 diagram directly to stdout
-  ${c.dim("--no-typeclasses")}         Exclude [C α] constraints from graph
-`);
+  if (!query || rawArgs.includes("-h") || rawArgs.includes("--help")) {
+    printHelp();
     process.exit(0);
   }
 
   const cwd = process.cwd();
-  const stdoutOnly = args.includes("-p") || args.includes("--print");
-  const wantsHtml = args.includes("-i") || args.includes("--html");
-  const shouldOpen = args.includes("--open");
-  const render = args.includes("-r") || args.includes("--render") || wantsHtml;
-  const verbose = args.includes("-v") || args.includes("--verbose") || args.includes("--full");
-  const includeTypeclasses = !args.includes("--no-typeclasses");
 
   if (!stdoutOnly) {
     console.log(c.bold(`🔍 Locating files for: ${c.brightCyan(query)}`));
@@ -70,14 +34,8 @@ ${c.bold("Options:")}
     console.log(`   🔗 Notation resolved: ${c.yellow(`"${query}"`)} => ${c.bold(c.green(target))}`);
   }
 
-  let outPath: string | null = null;
-  const outIdx = args.findIndex((a) => a === "-o" || a === "--output");
-  if (outIdx !== -1 && args[outIdx + 1]) {
-    outPath = args[outIdx + 1];
-  } else if (!stdoutOnly) {
-    const baseName = sanitizeFileName(target !== query ? target : query);
-    outPath = `${baseName}.d2`;
-  }
+  const baseName = sanitizeFileName(target !== query ? target : query);
+  const outPath = options.outPath ?? (!stdoutOnly ? `${baseName}.d2` : null);
 
   const graph = builder.buildGraph(query, { includeTypeclasses });
 
@@ -110,23 +68,53 @@ ${c.bold("Options:")}
         return;
       }
 
+      console.log(`🎨 Compiling layouts (Dagre & ELK)...`);
+      const dagreEntry = compileLayoutSvg(outPath, "dagre");
+      const elkEntry = compileLayoutSvg(outPath, "elk");
+
+      const layouts = [dagreEntry, elkEntry].filter(Boolean) as any[];
+
+      if (layouts.length === 0) {
+        console.error(c.red(`❌ Failed to compile diagrams via d2.`));
+        return;
+      }
+
+      // Save default SVG
       const svgPath = outPath.replace(/\.d2$/, ".svg");
-      console.log(`🎨 Compiling SVG via d2...`);
-      execFileSync("d2", [outPath, svgPath], { stdio: "inherit" });
-      console.log(`🎉 Rendered SVG: ${c.bold(c.green(svgPath))}`);
+      fs.writeFileSync(svgPath, layouts[0].svg, "utf-8");
+      console.log(`🎉 Rendered SVG (${c.bold(layouts[0].name)}): ${c.bold(c.green(svgPath))}`);
 
       if (wantsHtml) {
-        const svgContent = fs.readFileSync(svgPath, "utf-8");
-        const htmlContent = buildInteractiveHtml(svgContent, {
+        // Build standalone HTML bundle
+        const staticHtml = buildInteractiveHtml({
           rootSymbol: query,
           resolvedTarget: target,
+          layouts,
+          isServerBacked: false,
         });
+
         const htmlPath = outPath.replace(/\.d2$/, ".html");
-        fs.writeFileSync(htmlPath, htmlContent, "utf-8");
-        console.log(`🌐 Interactive HTML generated: ${c.bold(c.brightCyan(htmlPath))}`);
+        fs.writeFileSync(htmlPath, staticHtml, "utf-8");
+        console.log(`🌐 Interactive HTML saved: ${c.bold(c.brightCyan(htmlPath))}`);
 
         if (shouldOpen) {
-          openInBrowser(htmlPath);
+          const srv = serveInteractiveHtml({
+            d2Path: outPath,
+            getInitialHtml: () =>
+              buildInteractiveHtml({
+                rootSymbol: query,
+                resolvedTarget: target,
+                layouts,
+                isServerBacked: true,
+              }),
+          });
+
+          console.log(`🚀 Serving live diagram at: ${c.bold(c.brightGreen(srv.url))}`);
+          console.log(c.dim(`   (Press Ctrl+C to stop server)`));
+          openBrowser(srv.url);
+
+          // Keep server running
+          await new Promise(() => { });
         }
       }
     }
